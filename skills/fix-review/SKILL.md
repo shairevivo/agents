@@ -61,8 +61,9 @@ Capture the start time at the very beginning:
 AGENT_START=$(date +%s)
 ```
 
-Before starting pre-commit (7b), before each retry iteration (7c), and
-before commit (8), check remaining time **only if `TIMEOUT_SECONDS` is set**:
+Before starting pre-commit (7b), before the direct-execution fallback
+inside 7b, before each retry iteration (7c), and before commit (8),
+check remaining time **only if `TIMEOUT_SECONDS` is set**:
 
 ```bash
 if [ -n "${TIMEOUT_SECONDS:-}" ]; then
@@ -72,8 +73,12 @@ if [ -n "${TIMEOUT_SECONDS:-}" ]; then
 fi
 ```
 
-Thresholds (fractions of budget):
+Thresholds (fractions of budget, except the fallback floor, which is
+a flat 300s — what it guards costs the same whatever the budget is):
 - **Before 7b (pre-commit):** < 10% remaining → skip pre-commit
+- **Before the direct-execution fallback in 7b:** < 300s remaining →
+  skip the fallback (its `pip install` steps risk a hard timeout),
+  proceed to 7c and disclose the skip in the commit message
 - **Before retry in 7c:** < 20% remaining → commit with disclosure
 - **Before 8 (commit):** < 8% remaining → skip gitlint validation
 
@@ -290,11 +295,17 @@ echo "::notice::STEP 7b: Pre-commit hooks"
 Same rules as the code agent (see step 9b of the code-implementation
 skill for the full text):
 - Maximum 2 pre-commit/hook-execution runs total across the entire
-  session. A `pre-commit run` that failed on infrastructure before
-  executing any hook does not count.
+  validation-loop iteration. A `pre-commit run` that failed on
+  infrastructure before executing any hook does not count — the
+  direct-execution fallback takes its place. If the 300s floor blocked
+  that fallback, no run was consumed and none may be spent later in
+  this iteration: 7b is closed either way. A validation-loop retry is
+  a new iteration and gets a fresh 2-run budget; 7c's own retries do
+  not reopen it.
 - Pre-format your code before running pre-commit.
 - If `pre-commit` itself cannot run — typically because it cannot
-  fetch remote hook repositories — do not skip verification. Fall
+  fetch remote hook repositories — do not skip verification, unless
+  the fallback floor below says you cannot afford it. Otherwise fall
   back to running the configured hooks directly, honoring each hook's
   `entry`, `args`, `rev`, `stages`, `additional_dependencies`, and
   file filters.
@@ -305,6 +316,67 @@ skill for the full text):
 ```bash
 test -f .pre-commit-config.yaml && pre-commit run --files <all-changed-files>
 ```
+
+**Time recheck before the fallback.** Run this check **only** when the `pre-commit
+run` above failed on infrastructure — it could not fetch its hook
+repositories, or died before executing any hook. It does not apply
+when the run passed, and it does not apply when hooks reported real
+errors: fix those and re-run as usual.
+
+The 10% gate that let you into 7b measured the fast path — a plain
+`pre-commit run` on a few files. The fallback is the expensive path:
+it `pip install`s each hook's tool at its pinned `rev` and runs the
+hooks one at a time. How long that takes scales with the number of
+remote hooks and their `additional_dependencies`, so do not talk
+yourself past the floor with a mental estimate. This agent runs on the
+tighter budget, so run the check rather than eyeballing it:
+
+```bash
+RUN_FALLBACK=1
+if [ -n "${TIMEOUT_SECONDS:-}" ] && [ -n "${AGENT_START:-}" ]; then
+  ELAPSED=$(( $(date +%s) - AGENT_START ))
+  REMAINING=$(( TIMEOUT_SECONDS - ELAPSED ))
+  # Absolute, not a fraction: what this floor guards costs about the
+  # same whatever the budget is, so scaling it with the budget only
+  # over-skips on the larger one. It can therefore sit at or below 7c's
+  # uncapped 20% retry floor — deliberately: retrying tests is
+  # optional, running the fallback when there is time is the point.
+  FLOOR=300
+  if [ "${REMAINING}" -lt "${FLOOR}" ]; then
+    RUN_FALLBACK=0
+    echo "::warning::Direct-execution fallback skipped: ${REMAINING}s remaining < ${FLOOR}s floor"
+  else
+    echo "::notice::Fallback time check: ${REMAINING}s remaining >= ${FLOOR}s floor — proceeding"
+  fi
+else
+  echo "::notice::Fallback time check skipped: TIMEOUT_SECONDS or AGENT_START unset — no floor applied"
+fi
+```
+
+Guard on `AGENT_START` as well as `TIMEOUT_SECONDS`. Unset, it
+evaluates as `0`, `ELAPSED` becomes the raw epoch second, and every
+run would fall below the floor — the gate would silently skip the
+fallback always, which is the expensive outcome this whole section
+exists to avoid. Print a line on every path: an empty result must
+never be how you conclude the check passed.
+
+If `RUN_FALLBACK` is `0`, do not run the fallback, treat 7b as
+finished, and go to 7c with this in the commit message:
+
+> Note: pre-commit hooks were not run. `pre-commit` could not
+> complete (infrastructure failure), and the remaining time budget
+> was below the floor for running the hooks directly.
+
+That skips `repo: local` hooks too, deliberately: a local `entry` can
+fetch on its own (`uvx`, `pip`), so it is not reliably the cheap case,
+and 7c's mandatory lint run still happens below the floor.
+
+Skipping this way consumes neither of your two runs and does not hand
+them back — 7b is closed for this validation-loop iteration either
+way. A retry is a new iteration with a fresh budget; that is what lets
+it fix a `pre-commit-blocked` failure.
+
+If `RUN_FALLBACK` is `1`, run the fallback as described above.
 
 **7c. Tests and linters — MANDATORY**
 
@@ -323,7 +395,11 @@ If tests fail due to your code:
 1. Read the failure output carefully.
 2. Fix the issue.
 3. Re-run secret scan (7a) and then tests (7c).
-4. Do NOT re-run pre-commit during retries.
+4. Do NOT re-run pre-commit during 7c retries — your pre-commit budget
+   for this validation-loop iteration is closed whether you spent it or
+   skipped it. A validation-loop retry is a new iteration with a new
+   budget. This is unrelated to `FIX_ITERATION`, which counts the
+   review→fix loop.
 
 The retry limit is read from `MAX_RETRIES` (default: 1).
 
